@@ -3,20 +3,23 @@ package form
 import (
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"sort"
+	"strings"
 	"sync"
 
-	"github.com/santhosh-tekuri/jsonschema/v2"
+	"github.com/ory/x/sqlxx"
 
-	"github.com/ory/x/errorsx"
+	"github.com/ory/jsonschema/v3"
 
 	"github.com/ory/x/decoderx"
 	"github.com/ory/x/jsonschemax"
 	"github.com/ory/x/jsonx"
 	"github.com/ory/x/stringslice"
 
-	"github.com/ory/kratos/persistence/aliases"
 	"github.com/ory/kratos/schema"
+	"github.com/ory/kratos/text"
 )
 
 var (
@@ -31,28 +34,33 @@ var (
 //
 // swagger:model form
 type HTMLForm struct {
-	*sync.RWMutex
+	sync.RWMutex `faker:"-"`
 
-	// Action should be used as the form action URL (<form action="{{ .Action }}" method="post">).
-	Action string `json:"action"`
+	// Action should be used as the form action URL `<form action="{{ .Action }}" method="post">`.
+	//
+	// required: true
+	Action string `json:"action" faker:"url"`
 
 	// Method is the form method (e.g. POST)
-	Method string `json:"method"`
+	//
+	// required: true
+	Method string `json:"method" faker:"http_method"`
 
 	// Fields contains the form fields.
+	//
+	// required: true
 	Fields Fields `json:"fields"`
 
-	// Errors contains all form errors. These will be duplicates of the individual field errors.
-	Errors []Error `json:"errors,omitempty"`
+	// Messages contains all global form messages and errors.
+	Messages text.Messages `json:"messages,omitempty"`
 }
 
 // NewHTMLForm returns an empty container.
 func NewHTMLForm(action string) *HTMLForm {
 	return &HTMLForm{
-		RWMutex: new(sync.RWMutex),
-		Action:  action,
-		Method:  "POST",
-		Fields:  Fields{},
+		Action: action,
+		Method: "POST",
+		Fields: Fields{},
 	}
 }
 
@@ -61,9 +69,7 @@ func NewHTMLForm(action string) *HTMLForm {
 func NewHTMLFormFromRequestBody(r *http.Request, action string, compiler decoderx.HTTPDecoderOption) (*HTMLForm, error) {
 	c := NewHTMLForm(action)
 	raw := json.RawMessage(`{}`)
-	if err := decoder.Decode(r, &raw, compiler,
-		decoderx.HTTPDecoderSetIgnoreParseErrorsStrategy(decoderx.ParseErrorIgnore),
-	); err != nil {
+	if err := decoder.Decode(r, &raw, compiler); err != nil {
 		if err := c.ParseError(err); err != nil {
 			return nil, err
 		}
@@ -79,19 +85,15 @@ func NewHTMLFormFromRequestBody(r *http.Request, action string, compiler decoder
 // NewHTMLFormFromJSON creates a HTML form based on the provided JSON struct.
 func NewHTMLFormFromJSON(action string, raw json.RawMessage, prefix string) *HTMLForm {
 	c := NewHTMLForm(action)
-	for k, v := range jsonx.Flatten(raw) {
-		if prefix != "" {
-			k = prefix + "." + k
-		}
-		c.SetValue(k, v)
-	}
+	c.SetValuesFromJSON(raw, prefix)
+
 	return c
 }
 
 // NewHTMLFormFromJSONSchema creates a new HTMLForm and populates the fields
 // using the provided JSON Schema.
-func NewHTMLFormFromJSONSchema(action, jsonSchemaRef, prefix string) (*HTMLForm, error) {
-	paths, err := jsonschemax.ListPaths(jsonSchemaRef, nil)
+func NewHTMLFormFromJSONSchema(action, jsonSchemaRef, prefix string, compiler *jsonschema.Compiler) (*HTMLForm, error) {
+	paths, err := jsonschemax.ListPaths(jsonSchemaRef, compiler)
 	if err != nil {
 		return nil, err
 	}
@@ -99,24 +101,48 @@ func NewHTMLFormFromJSONSchema(action, jsonSchemaRef, prefix string) (*HTMLForm,
 	c := NewHTMLForm(action)
 	for _, value := range paths {
 		name := addPrefix(value.Name, prefix, ".")
-		c.Fields[name] = Field{
-			Name: name,
-			Type: toFormType(value.Name, value.Type),
-		}
+		c.Fields = append(c.Fields, fieldFromPath(name, value))
 	}
 
 	return c, nil
 }
 
+func (c *HTMLForm) SortFields(schemaRef string) error {
+	sortFunc, err := c.Fields.sortBySchema(schemaRef, "")
+	if err != nil {
+		return err
+	}
+
+	sort.SliceStable(c.Fields, sortFunc)
+	return nil
+}
+
 // Reset resets the container's errors as well as each field's value and errors.
-func (c *HTMLForm) Reset() {
+func (c *HTMLForm) ResetMessages(exclude ...string) {
 	c.defaults()
 	c.Lock()
 	defer c.Unlock()
 
-	c.Errors = nil
+	c.Messages = nil
 	for k, f := range c.Fields {
-		f.Reset()
+		if !stringslice.Has(exclude, f.Name) {
+			f.Messages = nil
+		}
+		c.Fields[k] = f
+	}
+}
+
+// Reset resets the container's errors as well as each field's value and errors.
+func (c *HTMLForm) Reset(exclude ...string) {
+	c.defaults()
+	c.Lock()
+	defer c.Unlock()
+
+	c.Messages = nil
+	for k, f := range c.Fields {
+		if !stringslice.Has(exclude, f.Name) {
+			f.Reset()
+		}
 		c.Fields[k] = f
 	}
 }
@@ -128,43 +154,39 @@ func (c *HTMLForm) Reset() {
 // This method DOES NOT touch the values of the form fields, only its errors.
 func (c *HTMLForm) ParseError(err error) error {
 	c.defaults()
-	switch e := errorsx.Cause(err).(type) {
-	case richError:
+	if e := richError(nil); errors.As(err, &e) {
 		if e.StatusCode() == http.StatusBadRequest {
-			c.AddError(&Error{Message: e.Reason()})
+			c.AddMessage(text.NewValidationErrorGeneric(e.Reason()))
 			return nil
 		}
 		return err
-	case *jsonschema.ValidationError:
-		for _, err := range append([]*jsonschema.ValidationError{e}, e.Causes...) {
-			pointer, _ := jsonschemax.JSONPointerToDotNotation(err.InstancePtr)
-			if err.Context == nil {
-				// The pointer can be ignored because if there is an error, we'll just use
-				// the empty field (global error).
-				c.AddError(&Error{Message: err.Message}, pointer)
-				continue
-			}
-			switch ctx := err.Context.(type) {
-			case *jsonschema.ValidationContextRequired:
-				for _, required := range ctx.Missing {
-					// The pointer can be ignored because if there is an error, we'll just use
-					// the empty field (global error).
-					pointer, _ := jsonschemax.JSONPointerToDotNotation(required)
-					c.AddError(&Error{Message: err.Message}, pointer)
-				}
-			default:
-				c.AddError(&Error{Message: err.Message}, pointer)
-				continue
-			}
+	} else if e := new(schema.ValidationError); errors.As(err, &e) {
+		pointer, _ := jsonschemax.JSONPointerToDotNotation(e.InstancePtr)
+		for i := range e.Messages {
+			c.AddMessage(&e.Messages[i], pointer)
 		}
 		return nil
-	case schema.ResultErrors:
-		for _, ei := range e {
-			switch ei.Type() {
-			case "invalid_credentials":
-				c.AddError(&Error{Message: ei.Description()})
-			default:
-				c.AddError(&Error{Message: ei.String()}, ei.Field())
+	} else if e := new(jsonschema.ValidationError); errors.As(err, &e) {
+		switch ctx := e.Context.(type) {
+		case *jsonschema.ValidationErrorContextRequired:
+			for _, required := range ctx.Missing {
+				// The pointer can be ignored because if there is an error, we'll just use
+				// the empty field (global error).
+				pointer, _ := jsonschemax.JSONPointerToDotNotation(required)
+				segments := strings.Split(required, "/")
+				c.AddMessage(text.NewValidationErrorRequired(segments[len(segments)-1]), pointer)
+			}
+		default:
+			// The pointer can be ignored because if there is an error, we'll just use
+			// the empty field (global error).
+			var causes = e.Causes
+			if len(e.Causes) == 0 {
+				causes = []*jsonschema.ValidationError{e}
+			}
+
+			for _, ee := range causes {
+				pointer, _ := jsonschemax.JSONPointerToDotNotation(ee.InstancePtr)
+				c.AddMessage(text.NewValidationErrorGeneric(ee.Message), pointer)
 			}
 		}
 		return nil
@@ -180,47 +202,84 @@ func (c *HTMLForm) SetValues(values map[string]interface{}) {
 	}
 }
 
+// SetValuesFromJSON sets the container's fields to the provided values.
+func (c *HTMLForm) SetValuesFromJSON(raw json.RawMessage, prefix string) {
+	c.defaults()
+	for k, v := range jsonx.Flatten(raw) {
+		if prefix != "" {
+			k = prefix + "." + k
+		}
+		c.SetValue(k, v)
+	}
+}
+
+// getField returns a pointer to the field with the given name.
+func (c *HTMLForm) getField(name string) *Field {
+	// to prevent blocks we don't use c.defaults() here
+	if c.Fields == nil {
+		return nil
+	}
+
+	for i := range c.Fields {
+		if c.Fields[i].Name == name {
+			return &c.Fields[i]
+		}
+	}
+
+	return nil
+}
+
 // SetRequired sets the container's fields required.
 func (c *HTMLForm) SetRequired(fields ...string) {
 	c.defaults()
+	c.Lock()
+	defer c.Unlock()
+
 	for _, field := range fields {
-		ff, ok := c.Fields[field]
-		if !ok {
-			continue
+		if f := c.getField(field); f != nil {
+			f.Required = true
 		}
-		ff.Required = true
 	}
 }
 
 // Unset removes a field from the container.
-func (c *HTMLForm) Unset(name string) {
+func (c *HTMLForm) UnsetField(name string) {
 	c.defaults()
 	c.Lock()
 	defer c.Unlock()
 
-	delete(c.Fields, name)
+	for i := range c.Fields {
+		if c.Fields[i].Name == name {
+			c.Fields = append(c.Fields[:i], c.Fields[i+1:]...)
+			return
+		}
+	}
 }
 
 // SetCSRF sets the CSRF value using e.g. nosurf.Token(r).
 func (c *HTMLForm) SetCSRF(token string) {
-	c.defaults()
-	c.Lock()
-	defer c.Unlock()
-
-	c.Fields[CSRFTokenName] = Field{
+	c.SetField(Field{
 		Name:     CSRFTokenName,
 		Type:     "hidden",
 		Required: true,
 		Value:    token,
-	}
+	})
 }
 
 // SetField sets a field.
-func (c *HTMLForm) SetField(name string, field Field) {
+func (c *HTMLForm) SetField(field Field) {
 	c.defaults()
 	c.Lock()
 	defer c.Unlock()
-	c.Fields[name] = field
+
+	for i := range c.Fields {
+		if c.Fields[i].Name == field.Name {
+			c.Fields[i] = field
+			return
+		}
+	}
+
+	c.Fields = append(c.Fields, field)
 }
 
 // SetValue sets a container's field to the provided name and value.
@@ -229,55 +288,47 @@ func (c *HTMLForm) SetValue(name string, value interface{}) {
 	c.Lock()
 	defer c.Unlock()
 
-	ff, ok := c.Fields[name]
-	if !ok {
-		c.Fields[name] = Field{
-			Name:  name,
-			Type:  toFormType(name, value),
-			Value: value,
-		}
+	if f := c.getField(name); f != nil {
+		f.Value = value
+		return
 	}
-
-	ff.Name = name
-	ff.Value = value
-	if len(ff.Type) == 0 {
-		ff.Type = toFormType(name, value)
-	}
-	c.Fields[name] = ff
+	c.Fields = append(c.Fields, Field{
+		Name:  name,
+		Value: value,
+		Type:  toFormType(name, value),
+	})
 }
 
-// AddError adds the provided error, and if a non-empty names list is set,
+// AddMessage adds the provided error, and if a non-empty names list is set,
 // adds the error on the corresponding field.
-func (c *HTMLForm) AddError(err *Error, names ...string) {
+func (c *HTMLForm) AddMessage(err *text.Message, setForFields ...string) {
 	c.defaults()
 	c.Lock()
 	defer c.Unlock()
 
-	if len(stringslice.TrimSpaceEmptyFilter(names)) == 0 {
-		c.Errors = append(c.Errors, *err)
+	if len(stringslice.TrimSpaceEmptyFilter(setForFields)) == 0 {
+		c.Messages = append(c.Messages, *err)
 		return
 	}
 
-	for _, name := range names {
-		ff, ok := c.Fields[name]
-		if !ok {
-			c.Fields[name] = Field{
-				Name:   name,
-				Errors: []Error{*err},
-			}
+	for _, name := range setForFields {
+		if ff := c.getField(name); ff != nil {
+			ff.Messages = append(ff.Messages, *err)
 			continue
 		}
 
-		ff.Errors = append(ff.Errors, *err)
-		c.Fields[name] = ff
+		c.Fields = append(c.Fields, Field{
+			Name:     name,
+			Messages: text.Messages{*err},
+		})
 	}
 }
 
 func (c *HTMLForm) Scan(value interface{}) error {
-	return aliases.JSONScan(c, value)
+	return sqlxx.JSONScan(c, value)
 }
 func (c *HTMLForm) Value() (driver.Value, error) {
-	return aliases.JSONValue(c)
+	return sqlxx.JSONValue(c)
 }
 
 func (c *HTMLForm) defaults() {

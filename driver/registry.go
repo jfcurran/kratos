@@ -1,24 +1,37 @@
 package driver
 
 import (
-	"github.com/go-errors/errors"
+	"context"
+
+	"github.com/ory/kratos/metrics/prometheus"
+	"github.com/ory/x/tracing"
+
 	"github.com/gorilla/sessions"
-	"github.com/justinas/nosurf"
-	"github.com/sirupsen/logrus"
+	"github.com/pkg/errors"
+
+	"github.com/ory/x/logrusx"
+
+	"github.com/ory/kratos/continuity"
+	"github.com/ory/kratos/courier"
+	"github.com/ory/kratos/hash"
+	"github.com/ory/kratos/schema"
+	"github.com/ory/kratos/selfservice/flow/recovery"
+	"github.com/ory/kratos/selfservice/flow/settings"
+	"github.com/ory/kratos/selfservice/flow/verification"
+	"github.com/ory/kratos/selfservice/strategy/link"
 
 	"github.com/ory/x/healthx"
 
 	"github.com/ory/kratos/persistence"
 	"github.com/ory/kratos/selfservice/flow/login"
 	"github.com/ory/kratos/selfservice/flow/logout"
-	"github.com/ory/kratos/selfservice/flow/profile"
 	"github.com/ory/kratos/selfservice/flow/registration"
 
 	"github.com/ory/kratos/x"
 
 	"github.com/ory/x/dbal"
 
-	"github.com/ory/kratos/driver/configuration"
+	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/selfservice/errorx"
 	password2 "github.com/ory/kratos/selfservice/strategy/password"
@@ -28,23 +41,35 @@ import (
 type Registry interface {
 	dbal.Driver
 
-	Init() error
+	Init(ctx context.Context) error
 
-	WithConfig(c configuration.Provider) Registry
-	WithLogger(l logrus.FieldLogger) Registry
+	WithLogger(l *logrusx.Logger) Registry
 
-	BuildVersion() string
-	BuildDate() string
-	BuildHash() string
-	WithBuildInfo(version, hash, date string) Registry
+	WithCSRFHandler(c x.CSRFHandler)
+	WithCSRFTokenGenerator(cg x.CSRFToken)
 
-	WithCSRFHandler(c *nosurf.CSRFHandler)
-	CSRFHandler() *nosurf.CSRFHandler
 	HealthHandler() *healthx.Handler
-	CookieManager() sessions.Store
+	CookieManager(ctx context.Context) sessions.Store
+	MetricsHandler() *prometheus.Handler
+	ContinuityCookieManager(ctx context.Context) sessions.Store
 
+	RegisterRoutes(public *x.RouterPublic, admin *x.RouterAdmin)
+	RegisterPublicRoutes(public *x.RouterPublic)
+	RegisterAdminRoutes(admin *x.RouterAdmin)
+	PrometheusManager() *prometheus.MetricsManager
+	Tracer(context.Context) *tracing.Tracer
+
+	config.Provider
+	WithConfig(c *config.Config) Registry
+
+	x.CSRFProvider
 	x.WriterProvider
 	x.LoggingProvider
+
+	continuity.ManagementProvider
+	continuity.PersistenceProvider
+
+	courier.Provider
 
 	persistence.Provider
 
@@ -52,22 +77,29 @@ type Registry interface {
 	errorx.HandlerProvider
 	errorx.PersistenceProvider
 
+	hash.HashProvider
+
 	identity.HandlerProvider
 	identity.ValidationProvider
 	identity.PoolProvider
+	identity.PrivilegedPoolProvider
+	identity.ManagementProvider
+	identity.ActiveCredentialsCounterStrategyProvider
+
+	schema.HandlerProvider
 
 	password2.ValidationProvider
-	password2.HashProvider
 
 	session.HandlerProvider
 	session.ManagementProvider
 	session.PersistenceProvider
 
-	profile.HandlerProvider
-	profile.ErrorHandlerProvider
-	profile.RequestPersistenceProvider
+	settings.HandlerProvider
+	settings.ErrorHandlerProvider
+	settings.FlowPersistenceProvider
+	settings.StrategyProvider
 
-	login.RequestPersistenceProvider
+	login.FlowPersistenceProvider
 	login.ErrorHandlerProvider
 	login.HooksProvider
 	login.HookExecutorProvider
@@ -76,29 +108,34 @@ type Registry interface {
 
 	logout.HandlerProvider
 
-	registration.RequestPersistenceProvider
+	registration.FlowPersistenceProvider
 	registration.ErrorHandlerProvider
 	registration.HooksProvider
 	registration.HookExecutorProvider
 	registration.HandlerProvider
 	registration.StrategyProvider
+
+	verification.FlowPersistenceProvider
+	verification.ErrorHandlerProvider
+	verification.HandlerProvider
+	verification.StrategyProvider
+
+	link.SenderProvider
+	link.VerificationTokenPersistenceProvider
+	link.RecoveryTokenPersistenceProvider
+
+	recovery.FlowPersistenceProvider
+	recovery.ErrorHandlerProvider
+	recovery.HandlerProvider
+	recovery.StrategyProvider
+
+	x.CSRFTokenGeneratorProvider
 }
 
-type (
-	selfServiceStrategy interface {
-		login.Strategy
-		registration.Strategy
-	}
-	postHooks []interface {
-		login.PostHookExecutor
-		registration.PostHookExecutor
-	}
-)
-
-func NewRegistry(c configuration.Provider) (Registry, error) {
+func NewRegistryFromDSN(c *config.Config, l *logrusx.Logger) (Registry, error) {
 	driver, err := dbal.GetDriverFor(c.DSN())
 	if err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 
 	registry, ok := driver.(Registry)
@@ -106,5 +143,5 @@ func NewRegistry(c configuration.Provider) (Registry, error) {
 		return nil, errors.Errorf("driver of type %T does not implement interface Registry", driver)
 	}
 
-	return registry, nil
+	return registry.WithLogger(l).WithConfig(c), nil
 }

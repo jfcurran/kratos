@@ -1,68 +1,58 @@
 package driver
 
 import (
-	"bytes"
-	"encoding/json"
-	"fmt"
-	"net/url"
-
-	"github.com/ory/kratos/driver/configuration"
-	"github.com/ory/kratos/identity"
+	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/selfservice/hook"
 )
 
-func (m *RegistryDefault) hooksPost(credentialsType identity.CredentialsType, configs []configuration.SelfServiceHook) postHooks {
-	var i postHooks
+func (m *RegistryDefault) HookVerifier() *hook.Verifier {
+	if m.hookVerifier == nil {
+		m.hookVerifier = hook.NewVerifier(m)
+	}
+	return m.hookVerifier
+}
 
+func (m *RegistryDefault) HookSessionIssuer() *hook.SessionIssuer {
+	if m.hookSessionIssuer == nil {
+		m.hookSessionIssuer = hook.NewSessionIssuer(m)
+	}
+	return m.hookSessionIssuer
+}
+
+func (m *RegistryDefault) HookSessionDestroyer() *hook.SessionDestroyer {
+	if m.hookSessionDestroyer == nil {
+		m.hookSessionDestroyer = hook.NewSessionDestroyer(m)
+	}
+	return m.hookSessionDestroyer
+}
+
+func (m *RegistryDefault) WithHooks(hooks map[string]func(config.SelfServiceHook) interface{}) {
+	m.injectedSelfserviceHooks = hooks
+}
+
+func (m *RegistryDefault) getHooks(credentialsType string, configs []config.SelfServiceHook) (i []interface{}) {
 	for _, h := range configs {
-		switch h.Run {
+		switch h.Name {
 		case hook.KeySessionIssuer:
-			i = append(
-				i,
-				hook.NewSessionIssuer(m),
-			)
-		case hook.KeyRedirector:
-			var rc struct {
-				R string `json:"default_redirect_url"`
-				A bool   `json:"allow_user_defined_redirect"`
-			}
-
-			if err := json.NewDecoder(bytes.NewBuffer(h.Config)).Decode(&rc); err != nil {
-				m.l.WithError(err).
-					WithField("type", credentialsType).
-					WithField("hook", h.Run).
-					WithField("config", fmt.Sprintf("%s", h.Config)).
-					Errorf("The after hook is misconfigured.")
-				continue
-			}
-
-			rcr, err := url.ParseRequestURI(rc.R)
-			if err != nil {
-				m.l.WithError(err).
-					WithField("type", credentialsType).
-					WithField("hook", h.Run).
-					WithField("config", fmt.Sprintf("%s", h.Config)).
-					Errorf("The after hook is misconfigured.")
-				continue
-			}
-
-			i = append(
-				i,
-				hook.NewRedirector(
-					func() *url.URL {
-						return rcr
-					},
-					m.c.WhitelistedReturnToDomains,
-					func() bool {
-						return rc.A
-					},
-				),
-			)
+			i = append(i, m.HookSessionIssuer())
+		case hook.KeySessionDestroyer:
+			i = append(i, m.HookSessionDestroyer())
 		default:
+			var found bool
+			for name, m := range m.injectedSelfserviceHooks {
+				if name == h.Name {
+					i = append(i, m(h))
+					found = true
+					break
+				}
+			}
+			if found {
+				continue
+			}
 			m.l.
-				WithField("type", credentialsType).
-				WithField("hook", h.Run).
-				Errorf("A unknown post login hook was requested and can therefore not be used.")
+				WithField("for", credentialsType).
+				WithField("hook", h.Name).
+				Errorf("A unknown hook was requested and can therefore not be used")
 		}
 	}
 

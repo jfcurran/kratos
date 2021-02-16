@@ -4,44 +4,44 @@ import (
 	"context"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"testing"
 
 	"github.com/gobuffalo/httptest"
 	"github.com/julienschmidt/httprouter"
-	"github.com/justinas/nosurf"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/ory/viper"
-
-	"github.com/ory/kratos/driver/configuration"
+	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/internal"
+	"github.com/ory/kratos/internal/testhelpers"
 	"github.com/ory/kratos/selfservice/flow/logout"
 	"github.com/ory/kratos/session"
 	"github.com/ory/kratos/x"
+	"github.com/ory/nosurf"
 )
 
 func TestLogoutHandler(t *testing.T) {
-	_, reg := internal.NewRegistryDefault(t)
+	conf, reg := internal.NewFastRegistryWithMocks(t)
 	handler := reg.LogoutHandler()
 
-	viper.Set(configuration.ViperKeyDefaultIdentityTraitsSchemaURL, "file://./stub/registration.schema.json")
+	conf.MustSet(config.ViperKeyDefaultIdentitySchemaURL, "file://./stub/registration.schema.json")
+	conf.MustSet(config.ViperKeyPublicBaseURL, "http://example.com")
 
 	router := x.NewRouterPublic()
 	handler.RegisterPublicRoutes(router)
-	reg.WithCSRFHandler(x.NewCSRFHandler(router, reg.Writer(), logrus.New(), "/", "", false))
+	reg.WithCSRFHandler(x.NewCSRFHandler(router, reg))
 	ts := httptest.NewServer(reg.CSRFHandler())
 	defer ts.Close()
 
 	var sess session.Session
 	sess.ID = x.NewUUID()
 	sess.Identity = new(identity.Identity)
-	require.NoError(t, reg.IdentityPool().CreateIdentity(context.Background(), sess.Identity))
+	require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentity(context.Background(), sess.Identity))
 	require.NoError(t, reg.SessionPersister().CreateSession(context.Background(), &sess))
 
-	router.GET("/set", session.MockSetSession(t, reg))
+	router.GET("/set", testhelpers.MockSetSession(t, reg, conf))
 
 	router.GET("/csrf", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 		_, _ = w.Write([]byte(nosurf.Token(r)))
@@ -52,13 +52,13 @@ func TestLogoutHandler(t *testing.T) {
 	}))
 	defer redirTS.Close()
 
-	viper.Set(configuration.ViperKeySelfServiceLogoutRedirectURL, redirTS.URL)
-	viper.Set(configuration.ViperKeyURLsSelfPublic, ts.URL)
+	conf.MustSet(config.ViperKeySelfServiceLogoutBrowserDefaultReturnTo, redirTS.URL)
+	conf.MustSet(config.ViperKeyPublicBaseURL, ts.URL)
 
-	client := session.MockCookieClient(t)
+	client := testhelpers.NewClientWithCookies(t)
 
 	t.Run("case=set initial session", func(t *testing.T) {
-		session.MockHydrateCookieClient(t, client, ts.URL+"/set")
+		testhelpers.MockHydrateCookieClient(t, client, ts.URL+"/set")
 	})
 
 	var token string
@@ -73,7 +73,7 @@ func TestLogoutHandler(t *testing.T) {
 	})
 
 	t.Run("case=log out", func(t *testing.T) {
-		res, err := client.Get(ts.URL + logout.BrowserLogoutPath)
+		res, err := client.Get(ts.URL + logout.RouteBrowser)
 		require.NoError(t, err)
 
 		var found bool
@@ -83,6 +83,7 @@ func TestLogoutHandler(t *testing.T) {
 			}
 		}
 		require.False(t, found)
+		assert.Equal(t, redirTS.URL, res.Request.URL.String())
 	})
 
 	t.Run("case=csrf token should be reset", func(t *testing.T) {
@@ -93,5 +94,18 @@ func TestLogoutHandler(t *testing.T) {
 		require.NoError(t, res.Body.Close())
 		require.NotEmpty(t, body)
 		assert.NotEqual(t, token, string(body))
+	})
+
+	t.Run("case=respects return_to URI parameter", func(t *testing.T) {
+		returnToURL := ts.URL + "/after-logout"
+		conf.MustSet(config.ViperKeyURLsWhitelistedReturnToDomains, []string{returnToURL})
+
+		query := url.Values{
+			"return_to": {returnToURL},
+		}
+
+		res, err := client.Get(ts.URL + logout.RouteBrowser + "?" + query.Encode())
+		require.NoError(t, err)
+		assert.Equal(t, returnToURL, res.Request.URL.String())
 	})
 }

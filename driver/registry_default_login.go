@@ -1,41 +1,48 @@
 package driver
 
 import (
+	"context"
+
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/selfservice/flow/login"
 )
 
 func (m *RegistryDefault) LoginHookExecutor() *login.HookExecutor {
 	if m.selfserviceLoginExecutor == nil {
-		m.selfserviceLoginExecutor = login.NewHookExecutor(m, m.c)
+		m.selfserviceLoginExecutor = login.NewHookExecutor(m)
 	}
 	return m.selfserviceLoginExecutor
 }
 
-func (m *RegistryDefault) PreLoginHooks() []login.PreHookExecutor {
-	return []login.PreHookExecutor{}
+func (m *RegistryDefault) PreLoginHooks(ctx context.Context) (b []login.PreHookExecutor) {
+	for _, v := range m.getHooks("", m.Config(ctx).SelfServiceFlowLoginBeforeHooks()) {
+		if hook, ok := v.(login.PreHookExecutor); ok {
+			b = append(b, hook)
+		}
+	}
+	return
 }
 
-func (m *RegistryDefault) PostLoginHooks(credentialsType identity.CredentialsType) []login.PostHookExecutor {
-	a := m.hooksPost(credentialsType, m.c.SelfServiceLoginAfterHooks(string(credentialsType)))
-	b := make([]login.PostHookExecutor, len(a))
-	for k, v := range a {
-		b[k] = v
+func (m *RegistryDefault) PostLoginHooks(ctx context.Context, credentialsType identity.CredentialsType) (b []login.PostHookExecutor) {
+	for _, v := range m.getHooks(string(credentialsType), m.Config(ctx).SelfServiceFlowLoginAfterHooks(string(credentialsType))) {
+		if hook, ok := v.(login.PostHookExecutor); ok {
+			b = append(b, hook)
+		}
 	}
-	return b
+	return
 }
 
 func (m *RegistryDefault) LoginHandler() *login.Handler {
 	if m.selfserviceLoginHandler == nil {
-		m.selfserviceLoginHandler = login.NewHandler(m, m.c)
+		m.selfserviceLoginHandler = login.NewHandler(m)
 	}
 
 	return m.selfserviceLoginHandler
 }
 
-func (m *RegistryDefault) LoginRequestErrorHandler() *login.ErrorHandler {
+func (m *RegistryDefault) LoginFlowErrorHandler() *login.ErrorHandler {
 	if m.selfserviceLoginRequestErrorHandler == nil {
-		m.selfserviceLoginRequestErrorHandler = login.NewErrorHandler(m, m.c)
+		m.selfserviceLoginRequestErrorHandler = login.NewFlowErrorHandler(m)
 	}
 
 	return m.selfserviceLoginRequestErrorHandler

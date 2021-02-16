@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/bxcodec/faker"
+	"github.com/bxcodec/faker/v3"
 	"github.com/gobuffalo/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -15,18 +15,19 @@ import (
 	"github.com/ory/kratos/x"
 )
 
-type RequestPersister interface {
-	CreateRegistrationRequest(context.Context, *Request) error
-	GetRegistrationRequest(context.Context, uuid.UUID) (*Request, error)
-	UpdateRegistrationRequest(context.Context, uuid.UUID, identity.CredentialsType, *RequestMethod) error
+type FlowPersister interface {
+	UpdateRegistrationFlow(context.Context, *Flow) error
+	CreateRegistrationFlow(context.Context, *Flow) error
+	GetRegistrationFlow(context.Context, uuid.UUID) (*Flow, error)
+	UpdateRegistrationFlowMethod(context.Context, uuid.UUID, identity.CredentialsType, *FlowMethod) error
 }
 
-type RequestPersistenceProvider interface {
-	RegistrationRequestPersister() RequestPersister
+type FlowPersistenceProvider interface {
+	RegistrationFlowPersister() FlowPersister
 }
 
-func TestRequestPersister(p RequestPersister) func(t *testing.T) {
-	var clearids = func(r *Request) {
+func TestFlowPersister(ctx context.Context, p FlowPersister) func(t *testing.T) {
+	var clearids = func(r *Flow) {
 		r.ID = uuid.UUID{}
 		for k := range r.Methods {
 			r.Methods[k].ID = uuid.UUID{}
@@ -34,13 +35,13 @@ func TestRequestPersister(p RequestPersister) func(t *testing.T) {
 	}
 
 	return func(t *testing.T) {
-		t.Run("case=should error when the registration request does not exist", func(t *testing.T) {
-			_, err := p.GetRegistrationRequest(context.Background(), x.NewUUID())
+		t.Run("case=should error when the registration flow does not exist", func(t *testing.T) {
+			_, err := p.GetRegistrationFlow(ctx, x.NewUUID())
 			require.Error(t, err)
 		})
 
-		var newRequest = func(t *testing.T) *Request {
-			var r Request
+		var newFlow = func(t *testing.T) *Flow {
+			var r Flow
 			require.NoError(t, faker.FakeData(&r))
 			clearids(&r)
 
@@ -50,10 +51,10 @@ func TestRequestPersister(p RequestPersister) func(t *testing.T) {
 			return &r
 		}
 
-		t.Run("case=should create a new registration request and properly set IDs", func(t *testing.T) {
-			r := newRequest(t)
+		t.Run("case=should create a new registration flow and properly set IDs", func(t *testing.T) {
+			r := newFlow(t)
 			methods := len(r.Methods)
-			err := p.CreateRegistrationRequest(context.Background(), r)
+			err := p.CreateRegistrationFlow(ctx, r)
 			require.NoError(t, err, "%#v", err)
 
 			assert.Nil(t, r.MethodsRaw)
@@ -65,17 +66,17 @@ func TestRequestPersister(p RequestPersister) func(t *testing.T) {
 		})
 
 		t.Run("case=should create with set ids", func(t *testing.T) {
-			var r Request
+			var r Flow
 			require.NoError(t, faker.FakeData(&r))
-			require.NoError(t, p.CreateRegistrationRequest(context.Background(), &r))
+			require.NoError(t, p.CreateRegistrationFlow(ctx, &r))
 		})
 
-		t.Run("case=should create and fetch a registration request", func(t *testing.T) {
-			expected := newRequest(t)
-			err := p.CreateRegistrationRequest(context.Background(), expected)
+		t.Run("case=should create and fetch a registration flow", func(t *testing.T) {
+			expected := newFlow(t)
+			err := p.CreateRegistrationFlow(ctx, expected)
 			require.NoError(t, err)
 
-			actual, err := p.GetRegistrationRequest(context.Background(), expected.ID)
+			actual, err := p.GetRegistrationFlow(ctx, expected.ID)
 			require.NoError(t, err)
 			assert.Empty(t, actual.MethodsRaw)
 
@@ -87,33 +88,60 @@ func TestRequestPersister(p RequestPersister) func(t *testing.T) {
 			require.Equal(t, len(expected.Methods), len(actual.Methods), "expected:\t%s\nactual:\t%s", expected.Methods, actual.Methods)
 		})
 
-		t.Run("case=should update a registration request", func(t *testing.T) {
-			expected := newRequest(t)
+		t.Run("case=should update a registration flow", func(t *testing.T) {
+			expected := newFlow(t)
 			delete(expected.Methods, identity.CredentialsTypeOIDC)
-			err := p.CreateRegistrationRequest(context.Background(), expected)
+			err := p.CreateRegistrationFlow(ctx, expected)
 			require.NoError(t, err)
 
-			actual, err := p.GetRegistrationRequest(context.Background(), expected.ID)
+			actual, err := p.GetRegistrationFlow(ctx, expected.ID)
 			require.NoError(t, err)
 			assert.Len(t, actual.Methods, 1)
 
-			require.NoError(t, p.UpdateRegistrationRequest(context.Background(), expected.ID, identity.CredentialsTypeOIDC, &RequestMethod{
+			require.NoError(t, p.UpdateRegistrationFlowMethod(ctx, expected.ID, identity.CredentialsTypeOIDC, &FlowMethod{
 				Method: identity.CredentialsTypeOIDC,
-				Config: &RequestMethodConfig{form.NewHTMLForm(string(identity.CredentialsTypeOIDC))},
+				Config: &FlowMethodConfig{FlowMethodConfigurator: form.NewHTMLForm(string(identity.CredentialsTypeOIDC))},
 			}))
 
-			require.NoError(t, p.UpdateRegistrationRequest(context.Background(), expected.ID, identity.CredentialsTypePassword, &RequestMethod{
+			require.NoError(t, p.UpdateRegistrationFlowMethod(ctx, expected.ID, identity.CredentialsTypePassword, &FlowMethod{
 				Method: identity.CredentialsTypePassword,
-				Config: &RequestMethodConfig{form.NewHTMLForm(string(identity.CredentialsTypePassword))},
+				Config: &FlowMethodConfig{FlowMethodConfigurator: form.NewHTMLForm(string(identity.CredentialsTypePassword))},
 			}))
 
-			actual, err = p.GetRegistrationRequest(context.Background(), expected.ID)
+			actual, err = p.GetRegistrationFlow(ctx, expected.ID)
+			require.NoError(t, err)
+			require.Len(t, actual.Methods, 2)
+			assert.EqualValues(t, identity.CredentialsTypePassword, actual.Active)
+
+			js, _ := json.Marshal(actual.Methods)
+			assert.Equal(t, string(identity.CredentialsTypePassword), actual.Methods[identity.CredentialsTypePassword].Config.FlowMethodConfigurator.(*form.HTMLForm).Action, "%s", js)
+			assert.Equal(t, string(identity.CredentialsTypeOIDC), actual.Methods[identity.CredentialsTypeOIDC].Config.FlowMethodConfigurator.(*form.HTMLForm).Action)
+		})
+
+		t.Run("case=should not cause data loss when updating a request without changes", func(t *testing.T) {
+			expected := newFlow(t)
+			expected.Active = ""
+			err := p.CreateRegistrationFlow(ctx, expected)
+			require.NoError(t, err)
+
+			actual, err := p.GetRegistrationFlow(ctx, expected.ID)
+			require.NoError(t, err)
+			assert.Len(t, actual.Methods, 2)
+
+			require.NoError(t, p.UpdateRegistrationFlow(ctx, actual))
+
+			actual, err = p.GetRegistrationFlow(ctx, expected.ID)
 			require.NoError(t, err)
 			require.Len(t, actual.Methods, 2)
 
-			js, _ := json.Marshal(actual.Methods)
-			assert.Equal(t, string(identity.CredentialsTypePassword), actual.Methods[identity.CredentialsTypePassword].Config.RequestMethodConfigurator.(*form.HTMLForm).Action, "%s", js)
-			assert.Equal(t, string(identity.CredentialsTypeOIDC), actual.Methods[identity.CredentialsTypeOIDC].Config.RequestMethodConfigurator.(*form.HTMLForm).Action)
+			assert.Equal(t,
+				expected.Methods[identity.CredentialsTypePassword].Config.FlowMethodConfigurator.(*form.HTMLForm).Action,
+				actual.Methods[identity.CredentialsTypePassword].Config.FlowMethodConfigurator.(*form.HTMLForm).Action,
+			)
+			assert.Equal(t,
+				expected.Methods[identity.CredentialsTypeOIDC].Config.FlowMethodConfigurator.(*form.HTMLForm).Action,
+				actual.Methods[identity.CredentialsTypeOIDC].Config.FlowMethodConfigurator.(*form.HTMLForm).Action,
+			)
 		})
 	}
 }

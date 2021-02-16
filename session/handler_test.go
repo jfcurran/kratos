@@ -1,28 +1,35 @@
 package session_test
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/ory/kratos/corpx"
+
 	"github.com/julienschmidt/httprouter"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ory/x/pointerx"
+
 	"github.com/ory/x/urlx"
 
-	"github.com/ory/viper"
-
-	"github.com/ory/kratos/driver/configuration"
+	"github.com/ory/kratos-client-go/client/public"
+	"github.com/ory/kratos-client-go/models"
+	"github.com/ory/kratos/driver/config"
+	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/internal"
+	"github.com/ory/kratos/internal/testhelpers"
 	. "github.com/ory/kratos/session"
 	"github.com/ory/kratos/x"
 )
 
 func init() {
-	internal.RegisterFakes()
+	corpx.RegisterFakes()
 }
 
 func send(code int) httprouter.Handle {
@@ -31,47 +38,81 @@ func send(code int) httprouter.Handle {
 	}
 }
 
-func TestHandler(t *testing.T) {
+func TestSessionWhoAmI(t *testing.T) {
 	t.Run("public", func(t *testing.T) {
-		_, reg := internal.NewRegistryDefault(t)
+		conf, reg := internal.NewFastRegistryWithMocks(t)
 		r := x.NewRouterPublic()
 
-		h, _ := MockSessionCreateHandler(t, reg)
+		// set this intermediate because kratos needs some valid url for CRUDE operations
+		conf.MustSet(config.ViperKeyPublicBaseURL, "http://example.com")
+		h, _ := testhelpers.MockSessionCreateHandler(t, reg)
 		r.GET("/set", h)
 
 		NewHandler(reg).RegisterPublicRoutes(r)
 		ts := httptest.NewServer(r)
 		defer ts.Close()
 
-		viper.Set(configuration.ViperKeyURLsSelfPublic, ts.URL)
-
-		client := MockCookieClient(t)
+		conf.MustSet(config.ViperKeyPublicBaseURL, ts.URL)
+		client := testhelpers.NewClientWithCookies(t)
 
 		// No cookie yet -> 401
-		res, err := client.Get(ts.URL + "/sessions/me")
+		res, err := client.Get(ts.URL + RouteWhoami)
 		require.NoError(t, err)
 		assert.EqualValues(t, http.StatusUnauthorized, res.StatusCode)
 
 		// Set cookie
-		MockHydrateCookieClient(t, client, ts.URL+"/set")
+		testhelpers.MockHydrateCookieClient(t, client, ts.URL+"/set")
 
-		// Cookie set -> 200
-		res, err = client.Get(ts.URL + "/sessions/me")
-		require.NoError(t, err)
-		assert.EqualValues(t, http.StatusOK, res.StatusCode)
+		// Cookie set -> 200 (GET)
+		for _, method := range []string{
+			"GET",
+			"POST",
+			"PUT",
+			"DELETE",
+		} {
+			t.Run("http_method="+method, func(t *testing.T) {
+				req, err := http.NewRequest(method, ts.URL+RouteWhoami, nil)
+				require.NoError(t, err)
+
+				res, err = client.Do(req)
+				require.NoError(t, err)
+				assert.EqualValues(t, http.StatusOK, res.StatusCode)
+				assert.NotEmpty(t, res.Header.Get("X-Kratos-Authenticated-Identity-Id"))
+			})
+		}
 	})
 }
 
+func TestSessionRevoke(t *testing.T) {
+	conf, reg := internal.NewFastRegistryWithMocks(t)
+	publicTS, _ := testhelpers.NewKratosServer(t, reg)
+	conf.MustSet(config.ViperKeyDefaultIdentitySchemaURL, "file://stub/identity.schema.json")
+	i := &identity.Identity{Traits: identity.Traits(`{"baz":"bar"}`)}
+	require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentity(context.Background(), i))
+	sess := NewActiveSession(i, conf, time.Now())
+	require.NoError(t, reg.SessionPersister().CreateSession(context.Background(), sess))
+
+	sdk := testhelpers.NewSDKClient(publicTS)
+	_, err := sdk.Public.RevokeSession(public.NewRevokeSessionParams().WithBody(&models.RevokeSession{
+		SessionToken: pointerx.String(sess.Token)}))
+	require.NoError(t, err)
+
+	actual, err := reg.SessionPersister().GetSession(context.Background(), sess.ID)
+	require.NoError(t, err)
+	assert.False(t, actual.Active)
+	assert.False(t, actual.IsActive())
+}
+
 func TestIsNotAuthenticatedSecurecookie(t *testing.T) {
-	_, reg := internal.NewRegistryDefault(t)
+	conf, reg := internal.NewFastRegistryWithMocks(t)
 	r := x.NewRouterPublic()
 	r.GET("/public/with-callback", reg.SessionHandler().IsNotAuthenticated(send(http.StatusOK), send(http.StatusBadRequest)))
 
 	ts := httptest.NewServer(r)
 	defer ts.Close()
-	viper.Set(configuration.ViperKeyURLsSelfPublic, ts.URL)
+	conf.MustSet(config.ViperKeyPublicBaseURL, ts.URL)
 
-	c := MockCookieClient(t)
+	c := testhelpers.NewClientWithCookies(t)
 	c.Jar.SetCookies(urlx.ParseOrPanic(ts.URL), []*http.Cookie{
 		{
 			Name: DefaultSessionCookieName,
@@ -90,19 +131,23 @@ func TestIsNotAuthenticatedSecurecookie(t *testing.T) {
 }
 
 func TestIsNotAuthenticated(t *testing.T) {
-	_, reg := internal.NewRegistryDefault(t)
+	conf, reg := internal.NewFastRegistryWithMocks(t)
 	r := x.NewRouterPublic()
+	// set this intermediate because kratos needs some valid url for CRUDE operations
+	conf.MustSet(config.ViperKeyPublicBaseURL, "http://example.com")
 
-	h, _ := MockSessionCreateHandler(t, reg)
+	reg.WithCSRFHandler(new(x.FakeCSRFHandler))
+	h, _ := testhelpers.MockSessionCreateHandler(t, reg)
 	r.GET("/set", h)
 	r.GET("/public/with-callback", reg.SessionHandler().IsNotAuthenticated(send(http.StatusOK), send(http.StatusBadRequest)))
 	r.GET("/public/without-callback", reg.SessionHandler().IsNotAuthenticated(send(http.StatusOK), nil))
 	ts := httptest.NewServer(r)
 	defer ts.Close()
-	viper.Set(configuration.ViperKeyURLsSelfPublic, ts.URL)
 
-	sessionClient := MockCookieClient(t)
-	MockHydrateCookieClient(t, sessionClient, ts.URL+"/set")
+	conf.MustSet(config.ViperKeyPublicBaseURL, ts.URL)
+
+	sessionClient := testhelpers.NewClientWithCookies(t)
+	testhelpers.MockHydrateCookieClient(t, sessionClient, ts.URL+"/set")
 
 	for k, tc := range []struct {
 		c    *http.Client
@@ -141,19 +186,20 @@ func TestIsNotAuthenticated(t *testing.T) {
 }
 
 func TestIsAuthenticated(t *testing.T) {
-	_, reg := internal.NewRegistryDefault(t)
+	conf, reg := internal.NewFastRegistryWithMocks(t)
+	reg.WithCSRFHandler(new(x.FakeCSRFHandler))
 	r := x.NewRouterPublic()
 
-	h, _ := MockSessionCreateHandler(t, reg)
+	h, _ := testhelpers.MockSessionCreateHandler(t, reg)
 	r.GET("/set", h)
 	r.GET("/privileged/with-callback", reg.SessionHandler().IsAuthenticated(send(http.StatusOK), send(http.StatusBadRequest)))
 	r.GET("/privileged/without-callback", reg.SessionHandler().IsAuthenticated(send(http.StatusOK), nil))
 	ts := httptest.NewServer(r)
 	defer ts.Close()
-	viper.Set(configuration.ViperKeyURLsSelfPublic, ts.URL)
+	conf.MustSet(config.ViperKeyPublicBaseURL, ts.URL)
 
-	sessionClient := MockCookieClient(t)
-	MockHydrateCookieClient(t, sessionClient, ts.URL+"/set")
+	sessionClient := testhelpers.NewClientWithCookies(t)
+	testhelpers.MockHydrateCookieClient(t, sessionClient, ts.URL+"/set")
 
 	for k, tc := range []struct {
 		c    *http.Client

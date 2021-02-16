@@ -1,16 +1,22 @@
 package identity
 
 import (
+	"context"
 	"database/sql/driver"
 	"encoding/json"
-	"reflect"
 	"sync"
 	"time"
+
+	"github.com/ory/kratos/corp"
+
+	"github.com/ory/herodot"
+	"github.com/ory/x/sqlxx"
+
+	"github.com/ory/kratos/driver/config"
 
 	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
 
-	"github.com/ory/kratos/persistence/aliases"
 	"github.com/ory/kratos/x"
 )
 
@@ -24,33 +30,57 @@ type (
 	Identity struct {
 		l *sync.RWMutex `db:"-" faker:"-"`
 
-		// ID is a unique identifier chosen by you. It can be a URN (e.g. "arn:aws:iam::123456789012"),
-		// a stringified integer (e.g. "123456789012"), a uuid (e.g. "9f425a8d-7efc-4768-8f23-7647a74fdf13"). It is up to you
-		// to pick a format you'd like. It is discouraged to use a personally identifiable value here, like the username
-		// or the email, as this field is immutable.
+		// ID is the identity's unique identifier.
+		//
+		// The Identity ID can not be changed and can not be chosen. This ensures future
+		// compatibility and optimization for distributed stores such as CockroachDB.
 		//
 		// required: true
-		ID uuid.UUID `json:"id" faker:"uuid" db:"id" rw:"r"`
+		ID uuid.UUID `json:"id" faker:"-" db:"id"`
 
 		// Credentials represents all credentials that can be used for authenticating this identity.
 		Credentials map[CredentialsType]Credentials `json:"-" faker:"-" db:"-"`
 
-		// TraitsSchemaURL is the JSON Schema to be used for validating the identity's traits.
+		// SchemaID is the ID of the JSON Schema to be used for validating the identity's traits.
 		//
-		// format: uri
-		TraitsSchemaURL string `json:"traits_schema_url,omitempty" faker:"-" db:"traits_schema_url"`
+		// required: true
+		SchemaID string `json:"schema_id" faker:"-" db:"schema_id"`
+
+		// SchemaURL is the URL of the endpoint where the identity's traits schema can be fetched from.
+		//
+		// format: url
+		// required: true
+		SchemaURL string `json:"schema_url" faker:"-" db:"-"`
 
 		// Traits represent an identity's traits. The identity is able to create, modify, and delete traits
 		// in a self-service manner. The input will always be validated against the JSON Schema defined
-		// in `traits_schema_url`.
+		// in `schema_url`.
 		//
 		// required: true
-		Traits Traits `json:"traits" form:"traits" faker:"-" db:"traits"`
+		Traits Traits `json:"traits" faker:"-" db:"traits"`
+
+		// VerifiableAddresses contains all the addresses that can be verified by the user.
+		//
+		// Extensions:
+		// ---
+		// x-omitempty: true
+		// ---
+		VerifiableAddresses []VerifiableAddress `json:"verifiable_addresses,omitempty" faker:"-" has_many:"identity_verifiable_addresses" fk_id:"identity_id"`
+
+		// RecoveryAddresses contains all the addresses that can be used to recover an identity.
+		//
+		// Extensions:
+		// ---
+		// x-omitempty: true
+		// ---
+		RecoveryAddresses []RecoveryAddress `json:"recovery_addresses,omitempty" faker:"-" has_many:"identity_recovery_addresses" fk_id:"identity_id"`
 
 		// CredentialsCollection is a helper struct field for gobuffalo.pop.
 		CredentialsCollection CredentialsCollection `json:"-" faker:"-" has_many:"identity_credentials" fk_id:"identity_id"`
+
 		// CreatedAt is a helper struct field for gobuffalo.pop.
 		CreatedAt time.Time `json:"-" db:"created_at"`
+
 		// UpdatedAt is a helper struct field for gobuffalo.pop.
 		UpdatedAt time.Time `json:"-" db:"updated_at"`
 	}
@@ -58,11 +88,15 @@ type (
 )
 
 func (t *Traits) Scan(value interface{}) error {
-	return aliases.JSONScan(t, value)
+	return sqlxx.JSONScan(t, value)
 }
 
-func (t *Traits) Value() (driver.Value, error) {
-	return aliases.JSONValue(t)
+func (t Traits) Value() (driver.Value, error) {
+	return sqlxx.JSONValue(t)
+}
+
+func (t *Traits) String() string {
+	return string(*t)
 }
 
 // MarshalJSON returns m as the JSON encoding of m.
@@ -82,8 +116,8 @@ func (t *Traits) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func (i Identity) TableName() string {
-	return "identities"
+func (i Identity) TableName(ctx context.Context) string {
+	return corp.ContextualizeTableName(ctx, "identities")
 }
 
 func (i *Identity) lock() *sync.RWMutex {
@@ -93,31 +127,10 @@ func (i *Identity) lock() *sync.RWMutex {
 	return i.l
 }
 
-func (i *Identity) CredentialsEqual(c map[CredentialsType]Credentials) bool {
-	if len(c) != len(i.Credentials) {
-		return false
-	}
+func (i *Identity) SetSecurityAnswers(answers map[string]string) {
+	i.lock().Lock()
+	defer i.lock().Unlock()
 
-	if len(c) == 0 && len(i.Credentials) == 0 {
-		return true
-	}
-
-	for k, expect := range i.Credentials {
-		actual, found := c[k]
-		if !found {
-			return false
-		}
-
-		if string(expect.Config) != string(actual.Config) {
-			return false
-		}
-
-		if !reflect.DeepEqual(expect.Identifiers, actual.Identifiers) {
-			return false
-		}
-	}
-
-	return true
 }
 
 func (i *Identity) SetCredentials(t CredentialsType, c Credentials) {
@@ -131,18 +144,6 @@ func (i *Identity) SetCredentials(t CredentialsType, c Credentials) {
 	i.Credentials[t] = c
 }
 
-func (i *Identity) CopyCredentials() map[CredentialsType]Credentials {
-	result := make(map[CredentialsType]Credentials)
-	for id, credential := range i.Credentials {
-		result[id] = Credentials{
-			Type:        credential.Type,
-			Identifiers: append([]string{}, credential.Identifiers...),
-			Config:      append([]byte{}, credential.Config...),
-		}
-	}
-	return result
-}
-
 func (i *Identity) GetCredentials(t CredentialsType) (*Credentials, bool) {
 	i.lock().RLock()
 	defer i.lock().RUnlock()
@@ -154,18 +155,37 @@ func (i *Identity) GetCredentials(t CredentialsType) (*Credentials, bool) {
 	return nil, false
 }
 
+func (i *Identity) ParseCredentials(t CredentialsType, config interface{}) (*Credentials, error) {
+	i.lock().RLock()
+	defer i.lock().RUnlock()
+
+	if c, ok := i.Credentials[t]; ok {
+		if err := json.Unmarshal(c.Config, config); err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return &c, nil
+	}
+
+	return nil, herodot.ErrNotFound.WithReasonf("identity does not have credential type %s", t)
+}
+
 func (i *Identity) CopyWithoutCredentials() *Identity {
 	var ii = *i
 	ii.Credentials = nil
 	return &ii
 }
 
-func NewIdentity(traitsSchemaURL string) *Identity {
+func NewIdentity(traitsSchemaID string) *Identity {
+	if traitsSchemaID == "" {
+		traitsSchemaID = config.DefaultIdentityTraitsSchemaID
+	}
+
 	return &Identity{
-		ID:              x.NewUUID(),
-		Credentials:     map[CredentialsType]Credentials{},
-		Traits:          Traits(json.RawMessage("{}")),
-		TraitsSchemaURL: traitsSchemaURL,
-		l:               new(sync.RWMutex),
+		ID:                  x.NewUUID(),
+		Credentials:         map[CredentialsType]Credentials{},
+		Traits:              Traits("{}"),
+		SchemaID:            traitsSchemaID,
+		VerifiableAddresses: []VerifiableAddress{},
+		l:                   new(sync.RWMutex),
 	}
 }

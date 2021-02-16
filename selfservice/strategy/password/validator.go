@@ -2,12 +2,21 @@ package password
 
 import (
 	"bufio"
+	"context"
+
+	"github.com/ory/kratos/driver/config"
+
+	/* #nosec G505 sha1 is used for k-anonymity */
 	"crypto/sha1"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/arbovm/levenshtein"
+
+	"github.com/ory/x/httpx"
 
 	"github.com/pkg/errors"
 
@@ -21,7 +30,7 @@ type Validator interface {
 	// Validate returns nil if the password is passing the validation strategy and an error otherwise. If a validation error
 	// occurs, a regular error will be returned. If some other type of error occurs (e.g. HTTP request failed), an error
 	// of type *herodot.DefaultError will be returned.
-	Validate(identifier, password string) error
+	Validate(ctx context.Context, identifier, password string) error
 }
 
 type ValidationProvider interface {
@@ -29,6 +38,8 @@ type ValidationProvider interface {
 }
 
 var _ Validator = new(DefaultPasswordValidator)
+var ErrNetworkFailure = errors.New("unable to check if password has been leaked because an unexpected network error occurred")
+var ErrUnexpectedStatusCode = errors.New("unexpected status code")
 
 // DefaultPasswordValidator implements Validator. It is based on best
 // practices as defined in the following blog posts:
@@ -41,35 +52,63 @@ var _ Validator = new(DefaultPasswordValidator)
 // password has been breached in a previous data leak using k-anonymity.
 type DefaultPasswordValidator struct {
 	sync.RWMutex
-	c      *http.Client
+	reg    validatorDependencies
+	Client *http.Client
 	hashes map[string]int64
 
-	maxBreachesThreshold int64
+	minIdentifierPasswordDist            int
+	maxIdentifierPasswordSubstrThreshold float32
 }
 
-func NewDefaultPasswordValidatorStrategy() *DefaultPasswordValidator {
+type validatorDependencies interface {
+	config.Provider
+}
+
+func NewDefaultPasswordValidatorStrategy(reg validatorDependencies) *DefaultPasswordValidator {
 	return &DefaultPasswordValidator{
-		c:                    http.DefaultClient,
-		maxBreachesThreshold: 0,
-		hashes:               map[string]int64{},
-	}
+		Client:                    httpx.NewResilientClientLatencyToleranceMedium(nil),
+		reg:                       reg,
+		hashes:                    map[string]int64{},
+		minIdentifierPasswordDist: 5, maxIdentifierPasswordSubstrThreshold: 0.5}
 }
 
 func b20(src []byte) string {
 	return fmt.Sprintf("%X", src)
 }
 
+// code inspired by https://rosettacode.org/wiki/Longest_Common_Substring#Go
+func lcsLength(a, b string) int {
+	lengths := make([]int, len(a)*len(b))
+	greatestLength := 0
+	for i, x := range a {
+		for j, y := range b {
+			if x == y {
+				curr := 1
+				if i != 0 && j != 0 {
+					curr = lengths[(i-1)*len(b)+j-1] + 1
+				}
+
+				if curr > greatestLength {
+					greatestLength = curr
+				}
+				lengths[i*len(b)+j] = curr
+			}
+		}
+	}
+	return greatestLength
+}
+
 func (s *DefaultPasswordValidator) fetch(hpw []byte) error {
 	prefix := fmt.Sprintf("%X", hpw)[0:5]
 	loc := fmt.Sprintf("https://api.pwnedpasswords.com/range/%s", prefix)
-	res, err := s.c.Get(loc)
+	res, err := s.Client.Get(loc)
 	if err != nil {
-		return errors.WithStack(herodot.ErrInternalServerError.WithReasonf("Unable to check if password has been breached before: %s", err))
+		return errors.Wrapf(ErrNetworkFailure, "%s", err)
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		return errors.WithStack(herodot.ErrInternalServerError.WithReasonf("Unable to check if password has been breached before, expected status code 200 but got %d", res.StatusCode))
+		return errors.Wrapf(ErrUnexpectedStatusCode, "%d", res.StatusCode)
 	}
 
 	s.Lock()
@@ -102,15 +141,19 @@ func (s *DefaultPasswordValidator) fetch(hpw []byte) error {
 	return nil
 }
 
-func (s *DefaultPasswordValidator) Validate(identifier, password string) error {
+func (s *DefaultPasswordValidator) Validate(ctx context.Context, identifier, password string) error {
 	if len(password) < 6 {
 		return errors.Errorf("password length must be at least 6 characters but only got %d", len(password))
 	}
 
-	if password == identifier {
-		return errors.Errorf("the password can not be equal to the user identifier")
+	compIdentifier, compPassword := strings.ToLower(identifier), strings.ToLower(password)
+	dist := levenshtein.Distance(compIdentifier, compPassword)
+	lcs := float32(lcsLength(compIdentifier, compPassword)) / float32(len(compPassword))
+	if dist < s.minIdentifierPasswordDist || lcs > s.maxIdentifierPasswordSubstrThreshold {
+		return errors.Errorf("the password is too similar to the user identifier")
 	}
 
+	/* #nosec G401 sha1 is used for k-anonymity */
 	h := sha1.New()
 	if _, err := h.Write([]byte(password)); err != nil {
 		return err
@@ -122,14 +165,17 @@ func (s *DefaultPasswordValidator) Validate(identifier, password string) error {
 	s.RUnlock()
 
 	if !ok {
-		if err := s.fetch(hpw); err != nil {
+		err := s.fetch(hpw)
+		if (errors.Is(err, ErrNetworkFailure) || errors.Is(err, ErrUnexpectedStatusCode)) && s.reg.Config(ctx).PasswordPolicyConfig().IgnoreNetworkErrors {
+			return nil
+		} else if err != nil {
 			return err
 		}
 
-		return s.Validate(identifier, password)
+		return s.Validate(ctx, identifier, password)
 	}
 
-	if c > s.maxBreachesThreshold {
+	if c > int64(s.reg.Config(ctx).PasswordPolicyConfig().MaxBreaches) {
 		return errors.Errorf("the password has been found in at least %d data breaches and must no longer be used.", c)
 	}
 

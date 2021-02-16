@@ -3,80 +3,102 @@ package schema
 import (
 	"fmt"
 
-	"github.com/ory/gojsonschema"
+	"github.com/pkg/errors"
+
+	"github.com/ory/jsonschema/v3"
+
+	"github.com/ory/kratos/text"
 )
 
-func NewRequiredError(value interface{}, context *gojsonschema.JsonContext) error {
-	err := &gojsonschema.RequiredError{}
-	err.SetContext(context)
-	err.SetValue(value)
-	err.SetType("required")
-
-	err.SetDescription(gojsonschema.FormatErrorDescription(
-		gojsonschema.DefaultLocale{}.Required(),
-		gojsonschema.ErrorDetails{
-			"context":  context.String("."),
-			"value":    fmt.Sprintf("%v", value),
-			"field":    context.String("."),
-			"property": context.String("."),
-		},
-	))
-	return ResultErrors{err}
+type ValidationError struct {
+	*jsonschema.ValidationError
+	Messages text.Messages
 }
 
-func NewPasswordPolicyValidation(value interface{}, reason string, context *gojsonschema.JsonContext) error {
-	err := &gojsonschema.ResultErrorFields{}
-	err.SetContext(context)
-	err.SetValue(value)
-	err.SetType("password_policy_validation")
-
-	err.SetDescription(gojsonschema.FormatErrorDescription(
-		`{{.property}} does not meet the password policy because: {{.reason}}`,
-		gojsonschema.ErrorDetails{
-			"context":  context.String("."),
-			"value":    fmt.Sprintf("%v", value),
-			"field":    context.String("."),
-			"property": context.String("."),
-			"reason":   reason,
+func NewMinLengthError(instancePtr string, expected, actual int) error {
+	return errors.WithStack(&ValidationError{
+		ValidationError: &jsonschema.ValidationError{
+			Message:     fmt.Sprintf("length must be >= %d, but got %d", expected, actual),
+			InstancePtr: instancePtr,
 		},
-	))
-	return ResultErrors{err}
+		Messages: new(text.Messages).Add(text.NewErrorValidationMinLength(expected, actual)),
+	})
 }
+
+func NewRequiredError(missingPtr, missingFieldName string) error {
+	return errors.WithStack(&ValidationError{
+		ValidationError: &jsonschema.ValidationError{
+			Message:     fmt.Sprintf("missing properties: %s", missingFieldName),
+			InstancePtr: missingPtr,
+			Context: &jsonschema.ValidationErrorContextRequired{
+				Missing: []string{missingFieldName},
+			},
+		},
+		Messages: new(text.Messages).Add(text.NewValidationErrorRequired(missingFieldName)),
+	})
+}
+
+func NewInvalidFormatError(instancePtr, format, value string) error {
+	return errors.WithStack(&ValidationError{
+		ValidationError: &jsonschema.ValidationError{
+			Message:     fmt.Sprintf("%q is not valid %q", value, format),
+			InstancePtr: instancePtr,
+		},
+		Messages: new(text.Messages).Add(text.NewErrorValidationInvalidFormat(value, format)),
+	})
+}
+
+type ValidationErrorContextPasswordPolicyViolation struct {
+	Reason string
+}
+
+func (r *ValidationErrorContextPasswordPolicyViolation) AddContext(_, _ string) {}
+
+func (r *ValidationErrorContextPasswordPolicyViolation) FinishInstanceContext() {}
+
+func NewPasswordPolicyViolationError(instancePtr string, reason string) error {
+	return errors.WithStack(&ValidationError{
+		ValidationError: &jsonschema.ValidationError{
+			Message:     fmt.Sprintf("the password does not fulfill the password policy because: %s", reason),
+			InstancePtr: instancePtr,
+			Context: &ValidationErrorContextPasswordPolicyViolation{
+				Reason: reason,
+			},
+		},
+		Messages: new(text.Messages).Add(text.NewErrorValidationPasswordPolicyViolation(reason)),
+	})
+}
+
+type ValidationErrorContextInvalidCredentialsError struct{}
+
+func (r *ValidationErrorContextInvalidCredentialsError) AddContext(_, _ string) {}
+
+func (r *ValidationErrorContextInvalidCredentialsError) FinishInstanceContext() {}
 
 func NewInvalidCredentialsError() error {
-	err := &gojsonschema.ResultErrorFields{}
-	context := gojsonschema.NewJsonContext("", nil)
-	err.SetContext(context)
-	err.SetValue("")
-	err.SetType("invalid_credentials")
-
-	err.SetDescription(gojsonschema.FormatErrorDescription(
-		`The provided credentials are invalid. Check for spelling mistakes in your password or username, email address, or phone number.`,
-		gojsonschema.ErrorDetails{
-			"context":  context.String("."),
-			"value":    fmt.Sprintf("%v", ""),
-			"field":    context.String("."),
-			"property": context.String("."),
+	return errors.WithStack(&ValidationError{
+		ValidationError: &jsonschema.ValidationError{
+			Message:     `the provided credentials are invalid, check for spelling mistakes in your password or username, email address, or phone number`,
+			InstancePtr: "#/",
+			Context:     &ValidationErrorContextPasswordPolicyViolation{},
 		},
-	))
-	return ResultErrors{err}
+		Messages: new(text.Messages).Add(text.NewErrorValidationInvalidCredentials()),
+	})
 }
 
-func NewDuplicateCredentialsError() error {
-	err := &gojsonschema.ResultErrorFields{}
-	context := gojsonschema.NewJsonContext("", nil)
-	err.SetContext(context)
-	err.SetValue("")
-	err.SetType("invalid_credentials")
+type ValidationErrorContextDuplicateCredentialsError struct{}
 
-	err.SetDescription(gojsonschema.FormatErrorDescription(
-		`An account with the same identifier (email, phone, username, ...) exists already.`,
-		gojsonschema.ErrorDetails{
-			"context":  context.String("."),
-			"value":    fmt.Sprintf("%v", ""),
-			"field":    context.String("."),
-			"property": context.String("."),
+func (r *ValidationErrorContextDuplicateCredentialsError) AddContext(_, _ string) {}
+
+func (r *ValidationErrorContextDuplicateCredentialsError) FinishInstanceContext() {}
+
+func NewDuplicateCredentialsError() error {
+	return errors.WithStack(&ValidationError{
+		ValidationError: &jsonschema.ValidationError{
+			Message:     `an account with the same identifier (email, phone, username, ...) exists already`,
+			InstancePtr: "#/",
+			Context:     &ValidationErrorContextDuplicateCredentialsError{},
 		},
-	))
-	return ResultErrors{err}
+		Messages: new(text.Messages).Add(text.NewErrorValidationDuplicateCredentials()),
+	})
 }

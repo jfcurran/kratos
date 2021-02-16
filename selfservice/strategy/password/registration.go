@@ -1,22 +1,25 @@
 package password
 
 import (
+	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
-	"net/url"
+
+	"github.com/ory/x/pkgerx"
 
 	"github.com/julienschmidt/httprouter"
+	"github.com/markbates/pkger"
 	"github.com/pkg/errors"
 	"github.com/tidwall/sjson"
 
 	"github.com/ory/x/errorsx"
 
 	"github.com/ory/x/decoderx"
-	_ "github.com/ory/x/jsonschemax/fileloader"
-	_ "github.com/ory/x/jsonschemax/httploader"
 
-	"github.com/ory/gojsonschema"
+	"github.com/ory/kratos/driver/config"
+	"github.com/ory/kratos/selfservice/flow"
+	"github.com/ory/kratos/session"
+
 	"github.com/ory/herodot"
 	"github.com/ory/x/urlx"
 
@@ -24,85 +27,126 @@ import (
 	"github.com/ory/kratos/schema"
 	"github.com/ory/kratos/selfservice/flow/registration"
 	"github.com/ory/kratos/selfservice/form"
-	"github.com/ory/kratos/session"
+	"github.com/ory/kratos/selfservice/strategy"
 	"github.com/ory/kratos/x"
 )
 
 const (
-	RegistrationPath = "/auth/browser/methods/password/registration"
-
-	registrationFormPayloadSchema = `{
-  "$id": "https://schemas.ory.sh/kratos/selfservice/password/registration/config.schema.json",
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "type": "object",
-  "required": ["password", "traits"],
-  "properties": {
-    "password": {
-      "type": "string",
-      "minLength": 1
-    },
-    "traits": {}
-  }
-}`
+	RouteRegistration = "/self-service/registration/methods/password"
 )
 
 type RegistrationFormPayload struct {
-	Password string          `json:"password"`
-	Traits   json.RawMessage `json:"traits"`
+	Password  string          `json:"password"`
+	Traits    json.RawMessage `json:"traits"`
+	CSRFToken string          `json:"csrf_token"`
 }
 
-func (s *Strategy) RegisterRegistrationRoutes(r *x.RouterPublic) {
-	r.POST(RegistrationPath, s.d.SessionHandler().IsNotAuthenticated(s.handleRegistration, session.RedirectOnAuthenticated(s.c)))
+func (s *Strategy) RegisterRegistrationRoutes(public *x.RouterPublic) {
+	s.d.CSRFHandler().IgnorePath(RouteRegistration)
+
+	wrappedHandleRegistration := strategy.IsDisabled(s.d, s.ID().String(), s.handleRegistration)
+	public.POST(RouteRegistration, s.d.SessionHandler().IsNotAuthenticated(wrappedHandleRegistration, func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+		handler := session.RedirectOnAuthenticated(s.d)
+		if x.IsJSONRequest(r) {
+			handler = session.RespondWithJSONErrorOnAuthenticated(s.d.Writer(), registration.ErrAlreadyLoggedIn)
+		}
+
+		handler(w, r, ps)
+	}))
 }
 
-func (s *Strategy) handleRegistrationError(w http.ResponseWriter, r *http.Request, rr *registration.Request, p *RegistrationFormPayload, err error) {
+func (s *Strategy) handleRegistrationError(w http.ResponseWriter, r *http.Request, rr *registration.Flow, p *RegistrationFormPayload, err error) {
 	if rr != nil {
 		if method, ok := rr.Methods[identity.CredentialsTypePassword]; ok {
 			method.Config.Reset()
 
 			if p != nil {
-				for name, field := range form.NewHTMLFormFromJSON("", p.Traits, "traits").Fields {
-					method.Config.SetField(name, field)
+				for _, field := range form.NewHTMLFormFromJSON("", p.Traits, "traits").Fields {
+					// we only set the value and not the whole field because we want to keep types from the initial form generation
+					method.Config.SetValue(field.Name, field.Value)
 				}
 			}
 
-			method.Config.SetField("request", form.Field{
-				Name:     "request",
-				Type:     "hidden",
-				Required: true,
-				Value:    r.PostForm.Get("request"),
-			})
-			method.Config.SetCSRF(s.cg(r))
-
+			method.Config.SetCSRF(s.d.GenerateCSRFToken(r))
 			rr.Methods[identity.CredentialsTypePassword] = method
+			if errSec := method.Config.SortFields(s.d.Config(r.Context()).DefaultIdentityTraitsSchemaURL().String()); errSec != nil {
+				s.d.RegistrationFlowErrorHandler().WriteFlowError(w, r, identity.CredentialsTypePassword, rr, errors.Wrap(err, errSec.Error()))
+				return
+			}
 		}
 	}
 
-	s.d.RegistrationRequestErrorHandler().HandleRegistrationError(w, r, identity.CredentialsTypePassword, rr, err)
+	s.d.RegistrationFlowErrorHandler().WriteFlowError(w, r, identity.CredentialsTypePassword, rr, err)
 }
 
-func (s *Strategy) decoderRegistration() (decoderx.HTTPDecoderOption, error) {
-	raw, err := sjson.SetBytes([]byte(registrationFormPayloadSchema), "properties.traits.$ref", s.c.DefaultIdentityTraitsSchemaURL().String())
+func (s *Strategy) decode(p *RegistrationFormPayload, r *http.Request) error {
+	raw, err := sjson.SetBytes(pkgerx.MustRead(pkger.Open("github.com/ory/kratos:/selfservice/strategy/password/.schema/registration.schema.json")),
+		"properties.traits.$ref", s.d.Config(r.Context()).DefaultIdentityTraitsSchemaURL().String()+"#/properties/traits")
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return errors.WithStack(err)
 	}
 
-	o, err := decoderx.HTTPRawJSONSchemaCompiler(raw)
+	compiler, err := decoderx.HTTPRawJSONSchemaCompiler(raw)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return errors.WithStack(err)
 	}
 
-	return o, nil
+	return s.hd.Decode(r, p, compiler, decoderx.HTTPDecoderSetValidatePayloads(false), decoderx.HTTPDecoderJSONFollowsFormFormat())
 }
 
+// nolint:deadcode,unused
+// swagger:parameters completeSelfServiceRegistrationFlowWithPasswordMethod
+type completeSelfServiceRegistrationFlowWithPasswordMethodParameters struct {
+	// Flow is flow ID.
+	//
+	// in: query
+	Flow string `json:"flow"`
+
+	// in: body
+	Payload interface{}
+}
+
+// swagger:route POST /self-service/registration/methods/password public completeSelfServiceRegistrationFlowWithPasswordMethod
+//
+// Complete Registration Flow with Username/Email Password Method
+//
+// Use this endpoint to complete a registration flow by sending an identity's traits and password. This endpoint
+// behaves differently for API and browser flows.
+//
+// API flows expect `application/json` to be sent in the body and respond with
+//   - HTTP 200 and a application/json body with the created identity success - if the session hook is configured the
+//     `session` and `session_token` will also be included;
+//   - HTTP 302 redirect to a fresh registration flow if the original flow expired with the appropriate error messages set;
+//   - HTTP 400 on form validation errors.
+//
+// Browser flows expect `application/x-www-form-urlencoded` to be sent in the body and responds with
+//   - a HTTP 302 redirect to the post/after registration URL or the `return_to` value if it was set and if the registration succeeded;
+//   - a HTTP 302 redirect to the registration UI URL with the flow ID containing the validation errors otherwise.
+//
+// More information can be found at [ORY Kratos User Login and User Registration Documentation](https://www.ory.sh/docs/next/kratos/self-service/flows/user-login-user-registration).
+//
+//     Schemes: http, https
+//
+//     Consumes:
+//     - application/json
+//     - application/x-www-form-urlencoded
+//
+//     Produces:
+//     - application/json
+//
+//     Responses:
+//       200: registrationViaApiResponse
+//       302: emptyResponse
+//       400: registrationFlow
+//       500: genericError
 func (s *Strategy) handleRegistration(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	rid := x.ParseUUID(r.URL.Query().Get("request"))
+	rid := x.ParseUUID(r.URL.Query().Get("flow"))
 	if x.IsZeroUUID(rid) {
-		s.handleRegistrationError(w, r, nil, nil, errors.WithStack(herodot.ErrBadRequest.WithReasonf("The request Code is missing.")))
+		s.handleRegistrationError(w, r, nil, nil, errors.WithStack(herodot.ErrBadRequest.WithReasonf("The flow query parameter is missing.")))
 		return
 	}
 
-	ar, err := s.d.RegistrationRequestPersister().GetRegistrationRequest(r.Context(), rid)
+	ar, err := s.d.RegistrationFlowPersister().GetRegistrationFlow(r.Context(), rid)
 	if err != nil {
 		s.handleRegistrationError(w, r, nil, nil, err)
 		return
@@ -114,24 +158,18 @@ func (s *Strategy) handleRegistration(w http.ResponseWriter, r *http.Request, _ 
 	}
 
 	var p RegistrationFormPayload
-	option, err := s.decoderRegistration()
-	if err != nil {
-		s.handleRegistrationError(w, r, ar, nil, err)
+	if err := s.decode(&p, r); err != nil {
+		s.handleRegistrationError(w, r, ar, &p, err)
 		return
 	}
 
-	if err := decoderx.NewHTTP().Decode(r, &p,
-		decoderx.HTTPFormDecoder(),
-		option,
-		decoderx.HTTPDecoderSetIgnoreParseErrorsStrategy(decoderx.ParseErrorIgnore),
-		decoderx.HTTPDecoderSetValidatePayloads(false),
-	); err != nil {
+	if err := flow.VerifyRequest(r, ar.Type, s.d.Config(r.Context()).DisableAPIFlowEnforcement(), s.d.GenerateCSRFToken, p.CSRFToken); err != nil {
 		s.handleRegistrationError(w, r, ar, &p, err)
 		return
 	}
 
 	if len(p.Password) == 0 {
-		s.handleRegistrationError(w, r, ar, &p, errors.WithStack(schema.NewRequiredError("", gojsonschema.NewJsonContext("password", nil))))
+		s.handleRegistrationError(w, r, ar, &p, schema.NewRequiredError("#/password", "password"))
 		return
 	}
 
@@ -139,7 +177,7 @@ func (s *Strategy) handleRegistration(w http.ResponseWriter, r *http.Request, _ 
 		p.Traits = json.RawMessage("{}")
 	}
 
-	hpw, err := s.d.PasswordHasher().Generate([]byte(p.Password))
+	hpw, err := s.d.Hasher().Generate(r.Context(), []byte(p.Password))
 	if err != nil {
 		s.handleRegistrationError(w, r, ar, &p, err)
 		return
@@ -151,78 +189,65 @@ func (s *Strategy) handleRegistration(w http.ResponseWriter, r *http.Request, _ 
 		return
 	}
 
-	i := identity.NewIdentity(s.c.DefaultIdentityTraitsSchemaURL().String())
+	i := identity.NewIdentity(config.DefaultIdentityTraitsSchemaID)
 	i.Traits = identity.Traits(p.Traits)
-	i.SetCredentials(s.ID(), identity.Credentials{
-		Type:        s.ID(),
-		Identifiers: []string{},
-		Config:      json.RawMessage(co),
-	})
+	i.SetCredentials(s.ID(), identity.Credentials{Type: s.ID(), Identifiers: []string{}, Config: co})
 
-	if err := s.validateCredentials(i, p.Password); err != nil {
+	if err := s.validateCredentials(r.Context(), i, p.Password); err != nil {
 		s.handleRegistrationError(w, r, ar, &p, err)
 		return
 	}
 
-	if err := s.d.RegistrationExecutor().PostRegistrationHook(w, r,
-		s.d.PostRegistrationHooks(identity.CredentialsTypePassword),
-		ar,
-		i,
-	); errorsx.Cause(err) == registration.ErrHookAbortRequest {
-		return
-	} else if err != nil {
+	if err := s.d.RegistrationExecutor().PostRegistrationHook(w, r, identity.CredentialsTypePassword, ar, i); err != nil {
 		s.handleRegistrationError(w, r, ar, &p, err)
 		return
 	}
 }
 
-func (s *Strategy) validateCredentials(i *identity.Identity, pw string) error {
-	if err := s.d.IdentityValidator().Validate(i); err != nil {
+func (s *Strategy) validateCredentials(ctx context.Context, i *identity.Identity, pw string) error {
+	if err := s.d.IdentityValidator().Validate(ctx, i); err != nil {
 		return err
 	}
 
 	c, ok := i.GetCredentials(identity.CredentialsTypePassword)
 	if !ok {
 		// This should never happen
-		panic(fmt.Sprintf("identity object did not provide the %s CredentialType unexpectedly", identity.CredentialsTypePassword))
+		return errors.WithStack(x.PseudoPanic.WithReasonf("identity object did not provide the %s CredentialType unexpectedly", identity.CredentialsTypePassword))
 	} else if len(c.Identifiers) == 0 {
 		return errors.WithStack(herodot.ErrInternalServerError.WithReasonf("No login identifiers (e.g. email, phone number, username) were set. Contact an administrator, the identity schema is misconfigured."))
 	}
 
 	for _, id := range c.Identifiers {
-		if err := s.d.PasswordValidator().Validate(id, pw); err != nil {
+		if err := s.d.PasswordValidator().Validate(ctx, id, pw); err != nil {
 			if _, ok := errorsx.Cause(err).(*herodot.DefaultError); ok {
 				return err
 			}
-			return schema.NewPasswordPolicyValidation(
-				"",
-				err.Error(),
-				gojsonschema.NewJsonContext("password", nil),
-			)
+			return schema.NewPasswordPolicyViolationError("#/password", err.Error())
 		}
 	}
 
 	return nil
 }
 
-func (s *Strategy) PopulateRegistrationMethod(r *http.Request, sr *registration.Request) error {
-	action := urlx.CopyWithQuery(
-		urlx.AppendPaths(s.c.SelfPublicURL(), RegistrationPath),
-		url.Values{"request": {sr.ID.String()}},
-	)
+func (s *Strategy) PopulateRegistrationMethod(r *http.Request, sr *registration.Flow) error {
+	action := sr.AppendTo(urlx.AppendPaths(s.d.Config(r.Context()).SelfPublicURL(), RouteRegistration))
 
-	htmlf, err := form.NewHTMLFormFromJSONSchema(action.String(), s.c.DefaultIdentityTraitsSchemaURL().String(), "traits")
+	htmlf, err := form.NewHTMLFormFromJSONSchema(action.String(), s.d.Config(r.Context()).DefaultIdentityTraitsSchemaURL().String(), "", nil)
 	if err != nil {
 		return err
 	}
 
 	htmlf.Method = "POST"
-	htmlf.SetCSRF(s.cg(r))
-	htmlf.SetField("password", form.Field{Name: "password", Type: "password", Required: true})
+	htmlf.SetCSRF(s.d.GenerateCSRFToken(r))
+	htmlf.SetField(form.Field{Name: "password", Type: "password", Required: true})
 
-	sr.Methods[identity.CredentialsTypePassword] = &registration.RequestMethod{
+	if err := htmlf.SortFields(s.d.Config(r.Context()).DefaultIdentityTraitsSchemaURL().String()); err != nil {
+		return err
+	}
+
+	sr.Methods[identity.CredentialsTypePassword] = &registration.FlowMethod{
 		Method: identity.CredentialsTypePassword,
-		Config: &registration.RequestMethodConfig{RequestMethodConfigurator: &RequestMethod{HTMLForm: htmlf}},
+		Config: &registration.FlowMethodConfig{FlowMethodConfigurator: &FlowMethod{HTMLForm: htmlf}},
 	}
 
 	return nil

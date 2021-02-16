@@ -1,5 +1,5 @@
 linters:
-  enabled:
+  enable:
     - deadcode
     - errcheck
     - gosimple
@@ -8,14 +8,17 @@ linters:
     - structcheck
     - typecheck
     - unused
-    - bodyclose
-    - dupl
     - gosec
     - varcheck
-    - godox
   disable:
     - ineffassign
+    - dupl
+    - godox
+    - bodyclose # too many false negatives
 
 run:
   skip-dirs:
     - sdk/
+  skip-files:
+    - ".+_test.go"
+    - "corpx/faker.go"

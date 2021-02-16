@@ -1,55 +1,55 @@
 package identity
 
 import (
-	"github.com/ory/gojsonschema"
-	"github.com/ory/x/errorsx"
-	"github.com/ory/x/stringsx"
+	"context"
 
-	"github.com/ory/kratos/driver/configuration"
+	"github.com/tidwall/sjson"
+
+	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/schema"
 )
 
-type Validator struct {
-	c configuration.Provider
-	v *schema.Validator
-}
-
-type ValidationProvider interface {
-	IdentityValidator() *Validator
-}
-
-func NewValidator(c configuration.Provider) *Validator {
-	return &Validator{
-		c: c,
-		v: schema.NewValidator(),
+type (
+	validatorDependencies interface {
+		IdentityTraitsSchemas(ctx context.Context) schema.Schemas
+		config.Provider
 	}
+	Validator struct {
+		v *schema.Validator
+		d validatorDependencies
+	}
+	ValidationProvider interface {
+		IdentityValidator() *Validator
+	}
+)
+
+func NewValidator(d validatorDependencies) *Validator {
+	return &Validator{v: schema.NewValidator(), d: d}
 }
 
-type ValidationExtender interface {
-	WithIdentity(*Identity) ValidationExtender
-	schema.ValidationExtender
-}
-
-func (v *Validator) Validate(i *Identity) error {
-	es := []schema.ValidationExtender{
-		NewValidationExtensionIdentifier().WithIdentity(i),
+func (v *Validator) ValidateWithRunner(ctx context.Context, i *Identity, runners ...schema.Extension) error {
+	runner, err := schema.NewExtensionRunner(schema.ExtensionRunnerIdentityMetaSchema, runners...)
+	if err != nil {
+		return err
 	}
 
-	err := v.v.Validate(
-		stringsx.Coalesce(
-			i.TraitsSchemaURL,
-			v.c.DefaultIdentityTraitsSchemaURL().String(),
-		),
-		gojsonschema.NewBytesLoader(i.Traits),
-		es...,
+	s, err := v.d.IdentityTraitsSchemas(ctx).GetByID(i.SchemaID)
+	if err != nil {
+		return err
+	}
+
+	traits, err := sjson.SetRawBytes([]byte(`{}`), "traits", i.Traits)
+	if err != nil {
+		return err
+	}
+
+	return v.v.Validate(s.URL.String(), traits, schema.WithExtensionRunner(runner))
+}
+
+func (v *Validator) Validate(ctx context.Context, i *Identity) error {
+	return v.ValidateWithRunner(ctx, i,
+		NewSchemaExtensionCredentials(i),
+		NewSchemaExtensionVerification(i, v.d.Config(ctx).SelfServiceFlowVerificationRequestLifespan()),
+		NewSchemaExtensionRecovery(i),
 	)
-
-	switch errs := errorsx.Cause(err).(type) {
-	case schema.ResultErrors:
-		for k, err := range errs {
-			errs[k].SetContext(schema.ContextSetRoot(schema.ContextRemoveRootStub(err.Context()), "traits"))
-		}
-		return errs
-	}
-	return err
 }

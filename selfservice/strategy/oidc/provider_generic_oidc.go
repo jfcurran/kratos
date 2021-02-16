@@ -37,7 +37,7 @@ func (g *ProviderGenericOIDC) Config() *Configuration {
 
 func (g *ProviderGenericOIDC) provider(ctx context.Context) (*gooidc.Provider, error) {
 	if g.p == nil {
-		p, err := gooidc.NewProvider(context.Background(), g.config.IssuerURL)
+		p, err := gooidc.NewProvider(ctx, g.config.IssuerURL)
 		if err != nil {
 			return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("Unable to initialize OpenID Connect Provider: %s", err))
 		}
@@ -46,14 +46,7 @@ func (g *ProviderGenericOIDC) provider(ctx context.Context) (*gooidc.Provider, e
 	return g.p, nil
 }
 
-func (g *ProviderGenericOIDC) OAuth2(ctx context.Context) (*oauth2.Config, error) {
-	p, err := g.provider(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	endpoint := p.Endpoint()
-
+func (g *ProviderGenericOIDC) oauth2ConfigFromEndpoint(endpoint oauth2.Endpoint) *oauth2.Config {
 	scope := g.config.Scope
 	if !stringslice.Has(scope, gooidc.ScopeOpenID) {
 		scope = append(scope, gooidc.ScopeOpenID)
@@ -65,21 +58,35 @@ func (g *ProviderGenericOIDC) OAuth2(ctx context.Context) (*oauth2.Config, error
 		Endpoint:     endpoint,
 		Scopes:       scope,
 		RedirectURL:  g.config.Redir(g.public),
-	}, nil
+	}
 }
 
-func (g *ProviderGenericOIDC) Claims(ctx context.Context, exchange *oauth2.Token) (*Claims, error) {
-	raw, ok := exchange.Extra("id_token").(string)
-	if !ok || len(raw) == 0 {
-		return nil, errors.WithStack(ErrIDTokenMissing)
-	}
-
+func (g *ProviderGenericOIDC) OAuth2(ctx context.Context) (*oauth2.Config, error) {
 	p, err := g.provider(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	token, err := p.
+	endpoint := p.Endpoint()
+
+	return g.oauth2ConfigFromEndpoint(endpoint), nil
+}
+
+func (g *ProviderGenericOIDC) AuthCodeURLOptions(r ider) []oauth2.AuthCodeOption {
+	var options []oauth2.AuthCodeOption
+
+	if isForced(r) {
+		options = append(options, oauth2.SetAuthURLParam("prompt", "login"))
+	}
+	if len(g.config.RequestedClaims) != 0 {
+		options = append(options, oauth2.SetAuthURLParam("claims", string(g.config.RequestedClaims)))
+	}
+
+	return options
+}
+
+func (g *ProviderGenericOIDC) verifyAndDecodeClaimsWithProvider(ctx context.Context, provider *gooidc.Provider, raw string) (*Claims, error) {
+	token, err := provider.
 		Verifier(&gooidc.Config{
 			ClientID: g.config.ClientID,
 		}).
@@ -94,4 +101,18 @@ func (g *ProviderGenericOIDC) Claims(ctx context.Context, exchange *oauth2.Token
 	}
 
 	return &claims, nil
+}
+
+func (g *ProviderGenericOIDC) Claims(ctx context.Context, exchange *oauth2.Token) (*Claims, error) {
+	raw, ok := exchange.Extra("id_token").(string)
+	if !ok || len(raw) == 0 {
+		return nil, errors.WithStack(ErrIDTokenMissing)
+	}
+
+	p, err := g.provider(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return g.verifyAndDecodeClaimsWithProvider(ctx, p, raw)
 }

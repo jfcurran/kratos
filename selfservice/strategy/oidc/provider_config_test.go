@@ -1,27 +1,30 @@
 package oidc_test
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/ory/viper"
-
-	"github.com/ory/kratos/driver/configuration"
+	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/internal"
 	"github.com/ory/kratos/selfservice/strategy/oidc"
 )
 
 func TestConfig(t *testing.T) {
-	conf, reg := internal.NewRegistryDefault(t)
+	conf, reg := internal.NewFastRegistryWithMocks(t)
 
-	viper.Set(configuration.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypeOIDC), json.RawMessage(`{"config":{"providers": [{"provider": "generic"}]}}`))
-	s := oidc.NewStrategy(reg, conf)
+	var c map[string]interface{}
+	require.NoError(t, json.NewDecoder(
+		bytes.NewBufferString(`{"config":{"providers": [{"provider": "generic"}]}}`)).Decode(&c))
+	conf.MustSet(config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypeOIDC), c)
 
-	collection, err := s.Config()
+	s := oidc.NewStrategy(reg)
+	collection, err := s.Config(context.Background())
 	require.NoError(t, err)
 
 	require.Len(t, collection.Providers, 1)
