@@ -43,8 +43,6 @@ New feature or request.
       ([kratos#820](https://github.com/ory/kratos/issues/820))
 - [ ] Add i18n support to mail templates
       ([kratos#834](https://github.com/ory/kratos/issues/834))
-- [ ] Add option for disabling registration
-      ([kratos#882](https://github.com/ory/kratos/issues/882))
 - [ ] Rename strategy to method in internal APIs and Documentation
       ([kratos#683](https://github.com/ory/kratos/issues/683)) -
       [@hackerman](https://github.com/aeneasr)
@@ -126,6 +124,8 @@ Something is not working.
 - [ ] panic: a handle is already registered for path
       '/self-service/recovery/methods/link'
       ([kratos#1068](https://github.com/ory/kratos/issues/1068))
+- [ ] Recovery link doesn't log out existing users
+      ([kratos#1077](https://github.com/ory/kratos/issues/1077))
 - [x] Sending JSON to complete oidc/password strategy flows causes CSRF issues
       ([kratos#378](https://github.com/ory/kratos/issues/378))
 - [x] Password reset emails sent twice by each of the two kratos pods in my
@@ -191,6 +191,9 @@ New feature or request.
       ([kratos#969](https://github.com/ory/kratos/issues/969))
 - [ ] Access identity schema information (e.g. usernames) within the jsonnet
       mapper ([kratos#987](https://github.com/ory/kratos/issues/987))
+- [ ] Add option for disabling registration
+      ([kratos#882](https://github.com/ory/kratos/issues/882)) -
+      [@hackerman](https://github.com/aeneasr)
 - [x] Support remote argon2 execution
       ([kratos#357](https://github.com/ory/kratos/issues/357)) -
       [@hackerman](https://github.com/aeneasr)

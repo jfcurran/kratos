@@ -834,13 +834,13 @@ serve:
   ## public ##
   #
   public:
-    ## Public Base URL ##
+    ## Base URL ##
     #
-    # The URL where the public endpoint is exposed at.
+    # The URL where the endpoint is exposed at. This domain is used to generate redirects, form URLs, and more.
     #
     # Examples:
+    # - https://my-app.com/
     # - https://my-app.com/.ory/kratos/public
-    # - /.ory/kratos/public/
     #
     # Set this value using environment variables on
     # - Linux/macOS:
@@ -848,7 +848,22 @@ serve:
     # - Windows Command Line (CMD):
     #    > set SERVE_PUBLIC_BASE_URL=<value>
     #
-    base_url: https://my-app.com/.ory/kratos/public
+    base_url: https://my-app.com/
+
+    ## Domain Aliases ##
+    #
+    # Adds an alias domain. If a request with the hostname (FQDN) matching the hostname in the alias is found, that URL is used as the base URL.
+    #
+    # Set this value using environment variables on
+    # - Linux/macOS:
+    #    $ export SERVE_PUBLIC_DOMAIN_ALIASES=<value>
+    # - Windows Command Line (CMD):
+    #    > set SERVE_PUBLIC_DOMAIN_ALIASES=<value>
+    #
+    domain_aliases:
+      - match_domain: localhost
+        base_path: /
+        scheme: http
 
     ## Public Host ##
     #
@@ -1080,7 +1095,146 @@ serve:
     #
     base_url: https://kratos.private-network:4434/
 
-## log ##
+## tracing ##
+#
+# ORY Hydra supports distributed tracing.
+#
+tracing:
+  ## service_name ##
+  #
+  # Specifies the service name to use on the tracer.
+  #
+  # Examples:
+  # - ORY Kratos
+  #
+  # Set this value using environment variables on
+  # - Linux/macOS:
+  #    $ export TRACING_SERVICE_NAME=<value>
+  # - Windows Command Line (CMD):
+  #    > set TRACING_SERVICE_NAME=<value>
+  #
+  service_name: ORY Kratos
+
+  ## providers ##
+  #
+  providers:
+    ## zipkin ##
+    #
+    # Configures the zipkin tracing backend.
+    #
+    # Examples:
+    # - server_url: http://localhost:9411/api/v2/spans
+    #
+    zipkin:
+      ## server_url ##
+      #
+      # The address of Zipkin server where spans should be sent to.
+      #
+      # Set this value using environment variables on
+      # - Linux/macOS:
+      #    $ export TRACING_PROVIDERS_ZIPKIN_SERVER_URL=<value>
+      # - Windows Command Line (CMD):
+      #    > set TRACING_PROVIDERS_ZIPKIN_SERVER_URL=<value>
+      #
+      server_url: http://localhost:9411/api/v2/spans
+
+    ## jaeger ##
+    #
+    # Configures the jaeger tracing backend.
+    #
+    jaeger:
+      ## propagation ##
+      #
+      # The tracing header format
+      #
+      # Examples:
+      # - jaeger
+      #
+      # Set this value using environment variables on
+      # - Linux/macOS:
+      #    $ export TRACING_PROVIDERS_JAEGER_PROPAGATION=<value>
+      # - Windows Command Line (CMD):
+      #    > set TRACING_PROVIDERS_JAEGER_PROPAGATION=<value>
+      #
+      propagation: jaeger
+
+      ## sampling ##
+      #
+      # Examples:
+      # - type: const
+      #   value: 1
+      #   server_url: http://localhost:5778/sampling
+      #
+      sampling:
+        ## type ##
+        #
+        # Set this value using environment variables on
+        # - Linux/macOS:
+        #    $ export TRACING_PROVIDERS_JAEGER_SAMPLING_TYPE=<value>
+        # - Windows Command Line (CMD):
+        #    > set TRACING_PROVIDERS_JAEGER_SAMPLING_TYPE=<value>
+        #
+        type: const
+
+        ## value ##
+        #
+        # Set this value using environment variables on
+        # - Linux/macOS:
+        #    $ export TRACING_PROVIDERS_JAEGER_SAMPLING_VALUE=<value>
+        # - Windows Command Line (CMD):
+        #    > set TRACING_PROVIDERS_JAEGER_SAMPLING_VALUE=<value>
+        #
+        value: 1
+
+        ## server_url ##
+        #
+        # Set this value using environment variables on
+        # - Linux/macOS:
+        #    $ export TRACING_PROVIDERS_JAEGER_SAMPLING_SERVER_URL=<value>
+        # - Windows Command Line (CMD):
+        #    > set TRACING_PROVIDERS_JAEGER_SAMPLING_SERVER_URL=<value>
+        #
+        server_url: http://localhost:5778/sampling
+
+      ## local_agent_address ##
+      #
+      # The address of the jaeger-agent where spans should be sent to.
+      #
+      # Examples:
+      # - 127.0.0.1:6831
+      #
+      # Set this value using environment variables on
+      # - Linux/macOS:
+      #    $ export TRACING_PROVIDERS_JAEGER_LOCAL_AGENT_ADDRESS=<value>
+      # - Windows Command Line (CMD):
+      #    > set TRACING_PROVIDERS_JAEGER_LOCAL_AGENT_ADDRESS=<value>
+      #
+      local_agent_address: 127.0.0.1:6831
+
+  ## provider ##
+  #
+  # Set this to the tracing backend you wish to use. Supports Jaeger, Zipkin and DataDog. If omitted or empty, tracing will be disabled. Use environment variables to configure DataDog (see https://docs.datadoghq.com/tracing/setup/go/#configuration).
+  #
+  # One of:
+  # - jaeger
+  # - zipkin
+  # - datadog
+  # - elastic-apm
+  #
+  # Examples:
+  # - jaeger
+  #
+  # Set this value using environment variables on
+  # - Linux/macOS:
+  #    $ export TRACING_PROVIDER=<value>
+  # - Windows Command Line (CMD):
+  #    > set TRACING_PROVIDER=<value>
+  #
+  provider: jaeger
+
+## Log ##
+#
+# Configure logging using the following options. Logging will always be sent to stdout and stderr.
 #
 log:
   ## Leak Sensitive Log Values ##
@@ -1097,6 +1251,8 @@ log:
 
   ## format ##
   #
+  # The log format can either be text or JSON.
+  #
   # One of:
   # - json
   # - text
@@ -1110,6 +1266,10 @@ log:
   format: json
 
   ## level ##
+  #
+  # Debug enables stack traces on errors. Can also be set using environment variable LOG_LEVEL.
+  #
+  # Default value: info
   #
   # One of:
   # - trace
@@ -1229,6 +1389,20 @@ session:
   ## cookie ##
   #
   cookie:
+    ## Session Cookie Name ##
+    #
+    # Sets the session cookie name. Use with care!
+    #
+    # Default value: ory_kratos_session
+    #
+    # Set this value using environment variables on
+    # - Linux/macOS:
+    #    $ export SESSION_COOKIE_NAME=<value>
+    # - Windows Command Line (CMD):
+    #    > set SESSION_COOKIE_NAME=<value>
+    #
+    name: ''
+
     ## Make Session Cookie Persistent ##
     #
     # If set to true will persist the cookie in the end-user's browser using the `max-age` parameter which is set to the `session.lifespan` value. Persistent cookies are not deleted when the browser is closed (e.g. on reboot or alt+f4).
@@ -1418,6 +1592,21 @@ courier:
     #    > set COURIER_SMTP_CONNECTION_URI=<value>
     #
     connection_uri: smtps://foo:bar@my-mailserver:1234/?skip_ssl_verify=false
+
+    ## SMTP Sender Name ##
+    #
+    # The recipient of an email will see this as the sender name.
+    #
+    # Examples:
+    # - Bob
+    #
+    # Set this value using environment variables on
+    # - Linux/macOS:
+    #    $ export COURIER_SMTP_FROM_NAME=<value>
+    # - Windows Command Line (CMD):
+    #    > set COURIER_SMTP_FROM_NAME=<value>
+    #
+    from_name: Bob
 
     ## SMTP Sender Address ##
     #
